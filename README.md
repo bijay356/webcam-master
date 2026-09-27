@@ -49,10 +49,11 @@ Works **100% offline without Internet** over Phone Hotspot, PC Mobile Hotspot, L
   4. **USB Cable** (Automatic ADB TCP bridge when plugged in).
 - **Live Connected Device Badge & Selector**: Displays the exact connected device model (e.g., `● LIVE: MOTOROLA EDGE 50 NEO`), connection mode, and IP address on both PC and phone.
 
-### 6. 🎙️ Wireless Microphone & Virtual Camera for Wondershare Filmora / OBS / Zoom
-- **Virtual Microphone Routing (`VB-Cable`)**: Routes your phone's 48 kHz PCM microphone stream to `CABLE Input` (`CABLE Output` in Filmora / OBS / Audacity) or any Windows audio target.
-- **Virtual Webcam (`Webcam Master (Phone)`)**: Registers a DirectShow virtual camera (`UnityCapture`) so Filmora and other tools can select `Webcam Master (Phone)` directly as a camera input.
-- **Standalone Voice Recorder (`● Record Voice (.WAV)`)**: Record standalone 48 kHz `.WAV` voice-over audio files with real-time waveform, dB meter, and volume boost (`20%`–`300%`).
+### 6. 🎙️ Live Wireless Microphone for Wondershare Filmora, OBS & All Screen Recorders (Voice + Video in the Same File)
+- **Automatic Windows Default Microphone Routing (`IPolicyConfig`)**: Automatically enables and sets `CABLE Output (VB-Audio Virtual Cable)` or `Stereo Mix (Realtek(R) Audio)` as the **Windows System-Wide Default Microphone** (`eConsole`, `eMultimedia`, `eCommunications`) with zero admin prompt required.
+- **Voice + Video in the Same File**: When you select **`🎙️ Mic Only`** (or **`📹 Cam + Mic`**) and record video inside **Wondershare Filmora**, **OBS Studio**, **Bandicam**, **Camtasia**, **ShareX**, **Clipchamp**, or any other screen recorder / video editor, your phone's live microphone voice is automatically recorded **inside the same video file** — no separate `.WAV` file or manual audio syncing needed.
+- **Virtual Webcam (`Webcam Master (Phone)`)**: Registers a DirectShow virtual camera (`UnityCapture`) so Filmora and other tools can select `Webcam Master (Phone)` or your PC Webcam directly as a camera input.
+- **Standalone Voice Recorder (`● Record Voice (.WAV)`)**: Optional standalone 48 kHz `.WAV` voice-over recorder with real-time waveform, dB meter, and volume boost (`20%`–`300%`).
 - **Background & Screen-Off Operation on Phone**: Runs an Android foreground microphone service + wake lock with a live blinking indicator dot so the mic keeps streaming even when your phone screen is locked.
 
 ### 7. 💾 Flexible Save Location & Built-in Media Launcher

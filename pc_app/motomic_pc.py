@@ -276,6 +276,133 @@ def ensure_virtual_camera_registered():
         return False
 
 
+def configure_windows_default_mic_for_recorders(restore_physical_mic: bool = False) -> str:
+    """
+    Automatically enables Windows Stereo Mix / VB-Cable Output and sets it as the
+    Windows Default Recording Device (eConsole, eMultimedia, eCommunications) using
+    the Windows CoreAudio IPolicyConfig COM interface (no Admin required).
+    This ensures Wondershare Filmora, OBS, Bandicam, Camtasia, and ALL external screen
+    recorders/video editors automatically capture the phone's voice and video in the SAME file!
+    """
+    if os.name != "nt":
+        return "System Default Mic"
+
+    cable_ep = None
+    cable_name = None
+    stereo_ep = None
+    stereo_name = None
+    phys_ep = None
+    phys_name = None
+
+    try:
+        cap_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, cap_path, 0, winreg.KEY_READ) as k:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(k, i)
+                    i += 1
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{cap_path}\\{sub}\\Properties", 0, winreg.KEY_READ) as pk:
+                        dev_desc = ""
+                        iface_name = ""
+                        j = 0
+                        while True:
+                            try:
+                                vname, vval, _ = winreg.EnumValue(pk, j)
+                                j += 1
+                                if vname.lower() == "{a45c254e-df1c-4efd-8020-67d146a850e0},2" and isinstance(vval, str):
+                                    dev_desc = vval
+                                elif vname.lower() == "{b3f8fa53-0004-438e-9003-51a46e139bfc},6" and isinstance(vval, str):
+                                    iface_name = vval
+                            except OSError:
+                                break
+                        full_label = f"{dev_desc} ({iface_name})" if iface_name else dev_desc
+                        dl = full_label.lower()
+                        ep_id = f"{{0.0.1.00000000}}.{sub}"
+                        if "cable output" in dl or "vb-audio" in dl:
+                            cable_ep = ep_id
+                            cable_name = full_label
+                        elif "stereo mix" in dl or "what u hear" in dl or "wave out" in dl:
+                            stereo_ep = ep_id
+                            stereo_name = full_label
+                        elif ("microphone" in dl or "mic" in dl) and "pc speaker" not in dl:
+                            if phys_ep is None or "array" in dl:
+                                phys_ep = ep_id
+                                phys_name = full_label
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    try:
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+            def __init__(self, g_str):
+                s = g_str.strip("{}").replace("-", "")
+                self.Data1 = int(s[0:8], 16)
+                self.Data2 = int(s[8:12], 16)
+                self.Data3 = int(s[12:16], 16)
+                b = bytes.fromhex(s[16:32])
+                for idx_b in range(8):
+                    self.Data4[idx_b] = b[idx_b]
+
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitialize(None)
+        clsid_policy = GUID("{870af99c-171d-4f9e-af0d-e63df40c2bc9}")
+        iid_policy = GUID("{f8679f50-850a-41cf-9c72-430f290290c8}")
+        ptr = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(clsid_policy),
+            None,
+            1,
+            ctypes.byref(iid_policy),
+            ctypes.byref(ptr),
+        )
+        if hr == 0 and ptr.value:
+            vtable = ctypes.cast(
+                ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            SetDefaultEndpoint = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int
+            )(vtable[13])
+            SetEndpointVisibility = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int
+            )(vtable[14])
+
+            # Always ensure both Virtual Cable Output and Stereo Mix are enabled & visible in Windows
+            for ep in (cable_ep, stereo_ep):
+                if ep:
+                    SetEndpointVisibility(ptr, ep, 1)
+
+            if restore_physical_mic and phys_ep and not cable_ep:
+                target_ep, target_name = phys_ep, phys_name
+            elif cable_ep:
+                target_ep, target_name = cable_ep, cable_name
+            elif stereo_ep:
+                target_ep, target_name = stereo_ep, stereo_name
+            else:
+                target_ep, target_name = phys_ep, (phys_name or "Windows Default Mic")
+
+            if target_ep:
+                for role in (0, 1, 2):  # eConsole, eMultimedia, eCommunications
+                    SetDefaultEndpoint(ptr, target_ep, role)
+            return target_name or "Stereo Mix (Realtek(R) Audio)"
+    except Exception:
+        pass
+
+    return cable_name or stereo_name or phys_name or "Windows Default Mic"
+
+
 class MotoMicEngine:
     def __init__(self):
         self.running = True
@@ -307,14 +434,15 @@ class MotoMicEngine:
         self.last_active_camera_source = "PHONE"
         self.available_pc_cameras = self._detect_pc_cameras()
 
-        # Audio Processing & Virtual Mic / Output Routing
+        # Audio Processing & Virtual Mic / Output Routing (ON by default for Filmora & all external recorders!)
         self.gain = 1.0
         self.noise_gate_db = -55.0
-        self.monitor_enabled = False
+        self.monitor_enabled = True
         self.virtual_mic_installed = False
-        self.anti_echo_enabled = True
+        self.anti_echo_enabled = False
         self.selected_output_device = None
         self.output_device_name = "None"
+        self.windows_default_mic_name = configure_windows_default_mic_for_recorders(restore_physical_mic=False)
 
         # Screen Recording Audio Options: Record PC System Sound + Voice Over (Phone Mic / PC Mic)
         self.record_pc_sound = True
@@ -562,6 +690,8 @@ class MotoMicEngine:
     def _auto_detect_virtual_mic_device(self) -> bool:
         try:
             all_devs = sd.query_devices()
+            fallback_idx = None
+            fallback_name = None
             for idx, d in enumerate(all_devs):
                 if d.get("max_output_channels", 0) > 0:
                     name_lower = d.get("name", "").lower()
@@ -570,8 +700,19 @@ class MotoMicEngine:
                         self.selected_output_device = idx
                         self.output_device_name = d["name"]
                         self.monitor_enabled = True
-                        self.log(f"Auto-selected Virtual Mic Pipe: {d['name']} (Filmora Mic: CABLE Output)")
+                        self.windows_default_mic_name = configure_windows_default_mic_for_recorders(restore_physical_mic=False)
+                        self.log(f"Auto-selected Virtual Mic Pipe: {d['name']} (Filmora Mic: {self.windows_default_mic_name})")
                         return True
+                    if fallback_idx is None and ("realtek" in name_lower or "speakers" in name_lower or "sound mapper" in name_lower):
+                        fallback_idx = idx
+                        fallback_name = d["name"]
+            if self.selected_output_device is None and fallback_idx is not None:
+                self.selected_output_device = fallback_idx
+                self.output_device_name = fallback_name
+                self.monitor_enabled = True
+                self.log(
+                    f"Live Mic Active for Filmora & Recorders -> {fallback_name} + Default Mic ({self.windows_default_mic_name})"
+                )
         except Exception:
             pass
         return False
@@ -629,7 +770,16 @@ class MotoMicEngine:
             device_idx = self.selected_output_device
 
         def audio_callback(outdata, frames, time_info, status):
-            if not self.monitor_enabled or not self.stream_enabled or self.app_mode == "WEBCAM_ONLY":
+            # When recording inside External Tools (Filmora, OBS, etc.), self.is_recording_mp4 is False,
+            # so full clarity audio is fed into Windows Default Mic (Stereo Mix / CABLE Output) & System Audio!
+            # When recording inside Webcam Master's own Screen Recorder without VB-Cable, mute speaker loopback
+            # because Webcam Master already mixes the direct digital phone mic stream into the MP4 file.
+            if (
+                not self.monitor_enabled
+                or not self.stream_enabled
+                or self.app_mode == "WEBCAM_ONLY"
+                or (self.is_recording_mp4 and not self.virtual_mic_installed)
+            ):
                 outdata.fill(0)
                 return
             try:
@@ -711,18 +861,29 @@ class MotoMicEngine:
                 self.camera_source = "OFF"
                 self.facecam_shape = "OFF"
                 self._clear_video_state()
-                if self.virtual_mic_installed:
-                    self.monitor_enabled = True
+                self.monitor_enabled = True
+                self.windows_default_mic_name = configure_windows_default_mic_for_recorders(restore_physical_mic=False)
+                if not self.audio_stream_active:
+                    self.start_audio_output(self.sample_rate, self.selected_output_device)
                 if notify_phone:
                     self.send_control_command({"cmd": "app_mode", "value": "MIC_ONLY"})
                     self.send_control_command({"cmd": "camera_source", "value": "OFF"})
-                self.log("🎙️ Mic Only Active: Camera turned OFF completely (Mobile & PC Camera stopped)")
+                self.log(
+                    f"🎙️ Mic Only Active: Camera OFF • Live Mic routed to Filmora & Recorders ({self.windows_default_mic_name})"
+                )
             else:
                 if self.camera_source == "OFF":
                     restore_cam = getattr(self, "last_active_camera_source", "PHONE")
                     if restore_cam == "PHONE" and not self.connected:
                         restore_cam = "PC_0"
                     self.camera_source = restore_cam
+                if mode == "WEBCAM_MIC":
+                    self.monitor_enabled = True
+                    self.windows_default_mic_name = configure_windows_default_mic_for_recorders(restore_physical_mic=False)
+                    if not self.audio_stream_active:
+                        self.start_audio_output(self.sample_rate, self.selected_output_device)
+                elif mode == "WEBCAM_ONLY":
+                    configure_windows_default_mic_for_recorders(restore_physical_mic=True)
                 if notify_phone:
                     self.send_control_command({"cmd": "app_mode", "value": mode})
                     self.send_control_command({"cmd": "camera_source", "value": self.camera_source})
@@ -739,11 +900,15 @@ class MotoMicEngine:
             self.app_mode = "MIC_ONLY"
             self.facecam_shape = "OFF"
             self._clear_video_state()
+            self.monitor_enabled = True
+            self.windows_default_mic_name = configure_windows_default_mic_for_recorders(restore_physical_mic=False)
+            if not self.audio_stream_active:
+                self.start_audio_output(self.sample_rate, self.selected_output_device)
             if not already_off:
                 if notify_phone:
                     self.send_control_command({"cmd": "app_mode", "value": "MIC_ONLY"})
                     self.send_control_command({"cmd": "camera_source", "value": "OFF"})
-                self.log("🚫 Camera Turned OFF (Mic Only Active)")
+                self.log(f"🚫 Camera Turned OFF (Mic Only Active for Filmora: {self.windows_default_mic_name})")
             return
 
         self.last_active_camera_source = source_code
@@ -753,6 +918,8 @@ class MotoMicEngine:
         self.stream_enabled = True
         if self.app_mode == "MIC_ONLY":
             self.app_mode = "WEBCAM_MIC"
+            self.monitor_enabled = True
+            self.windows_default_mic_name = configure_windows_default_mic_for_recorders(restore_physical_mic=False)
             if notify_phone and source_code == "PHONE":
                 self.send_control_command({"cmd": "app_mode", "value": "WEBCAM_MIC"})
         if notify_phone:
@@ -1641,6 +1808,8 @@ class MotoMicEngine:
             if not self.virtual_mic_installed:
                 if self._auto_detect_virtual_mic_device():
                     self.start_audio_output(self.sample_rate, self.selected_output_device)
+            if self.monitor_enabled and not self.audio_stream_active:
+                self.start_audio_output(self.sample_rate, self.selected_output_device)
 
             try:
                 proc = subprocess.run(
@@ -1731,6 +1900,8 @@ class MotoMicEngine:
             "last_saved_media_file": self.last_saved_media_file,
             "virtual_mic_installed": self.virtual_mic_installed,
             "output_device_name": self.output_device_name,
+            "windows_default_mic": getattr(self, "windows_default_mic_name", "Stereo Mix (Realtek(R) Audio)"),
+            "audio_stream_active": self.audio_stream_active,
             "monitor_enabled": self.monitor_enabled,
             "is_recording_wav": self.is_recording,
             "is_recording_mp4": self.is_recording_mp4,
@@ -3265,6 +3436,15 @@ class MotoMicApp:
 
     def _toggle_speaker_monitor(self):
         self.engine.monitor_enabled = not self.engine.monitor_enabled
+        if self.engine.monitor_enabled:
+            self.engine.windows_default_mic_name = configure_windows_default_mic_for_recorders(restore_physical_mic=False)
+            if not self.engine.audio_stream_active:
+                self.engine.start_audio_output(self.engine.sample_rate, self.engine.selected_output_device)
+            self.engine.log(
+                f"🎙️ Live Mic Routing -> ON for Filmora & Recorders (Default Mic: {self.engine.windows_default_mic_name})"
+            )
+        else:
+            self.engine.log("○ Live Mic Routing -> OFF")
         self._sync_buttons()
 
     def _toggle_mp4_recording(self):
@@ -3351,19 +3531,13 @@ class MotoMicApp:
                 self.cam_src_btns["OFF"].config(bg="#EF4444" if cam_off else "#334155")
 
         if self.engine.monitor_enabled:
-            if self.engine.virtual_mic_installed:
-                self.spk_toggle_btn.config(
-                    text="● Virtual Mic Routing: ON (Ready for Filmora / Tools)",
-                    bg="#10B981",
-                )
-            else:
-                self.spk_toggle_btn.config(
-                    text="● Route to Audio Target: ON (Live for Filmora / Tools)",
-                    bg="#F59E0B",
-                )
+            self.spk_toggle_btn.config(
+                text="● Live Mic for Filmora & Recorders: ON (Audio+Video in 1 File)",
+                bg="#10B981",
+            )
         else:
             self.spk_toggle_btn.config(
-                text="○ Route to Audio Target: OFF (Click to Enable for Filmora)",
+                text="○ Live Mic for Filmora & Recorders: OFF (Click to Enable)",
                 bg="#334155",
             )
 
@@ -3571,11 +3745,13 @@ class MotoMicApp:
             if not self.engine.stream_enabled:
                 msg = "○ Stream Stopped — Click the Stream Toggle Button on the Right"
             elif cam_is_off:
+                def_mic = getattr(self.engine, "windows_default_mic_name", "Stereo Mix (Realtek(R) Audio)")
                 msg = (
-                    "🎙️ MIC ONLY — CAMERA IS OFF\n\n"
-                    "• Camera is completely turned OFF (Mobile Camera & PC Webcam stopped).\n"
-                    "• Your microphone is active for Voice Over, Screen Recording, and Filmora.\n"
-                    "• To turn the camera ON anytime, click '📱 Mobile Camera' or '💻 PC Camera (Webcam)' above!"
+                    "🎙️ MIC ONLY — LIVE MICROPHONE FOR FILMORA & ALL RECORDERS\n\n"
+                    "• Camera is completely OFF (Mobile Camera & PC Webcam stopped).\n"
+                    f"• Windows Default Mic is auto-routed to your Phone Mic ({def_mic}).\n"
+                    "• Record directly in Filmora or any Screen Recorder — Voice + Video save in the SAME file!\n"
+                    "• To turn the camera ON anytime, click '📱 Mobile Cam' or '💻 PC Webcam' above."
                 )
             elif self.engine.standby_phone_detected:
                 msg = (
