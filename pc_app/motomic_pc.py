@@ -403,6 +403,236 @@ def configure_windows_default_mic_for_recorders(restore_physical_mic: bool = Fal
     return cable_name or stereo_name or phys_name or "Windows Default Mic"
 
 
+class SilentVirtualMicBridge:
+    """
+    Ensures ZERO sound comes out of the physical PC speakers when speaking into the mobile phone,
+    while routing 100% digital-clarity voice into Windows Default Mic (Stereo Mix) for Filmora & all recorders!
+    On Realtek HD Audio, Stereo Mix taps the digital Render bus BEFORE the physical speaker hardware mute switch
+    (IAudioEndpointVolume::SetMute(1)). By hardware-muting the physical speaker DAC while voice frames are on the
+    bus, the PC speakers emit 0.0% sound (no repeat/echo on PC) while Filmora records voice + video in the same file.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.speakers_muted_by_bridge = False
+        self.muted_since = 0.0
+        self.unmute_drain_started = 0.0
+        self.last_voice_ts = 0.0
+        self.last_pc_playback_ts = 0.0
+        self.saved_spk_vol = 0.35
+        self._tls = threading.local()
+        self._ensure_clean_initial_state()
+
+    def _ensure_clean_initial_state(self):
+        ifaces = self._get_com_interfaces()
+        if ifaces is not None:
+            try:
+                cur_m = ctypes.c_int()
+                ifaces["spk_get_mute"](ifaces["p_spk_vol"], ctypes.byref(cur_m))
+                cur_v = ctypes.c_float()
+                ifaces["spk_get_vol"](ifaces["p_spk_vol"], ctypes.byref(cur_v))
+                if 0.05 <= cur_v.value <= 0.85:
+                    self.saved_spk_vol = float(cur_v.value)
+                elif cur_v.value > 0.85:
+                    ifaces["spk_set_vol"](ifaces["p_spk_vol"], 0.35, None)
+                if cur_m.value != 0:
+                    ifaces["spk_set_mute"](ifaces["p_spk_vol"], 0, None)
+                ifaces["mic_set_mute"](ifaces["p_mic_vol"], 0, None)
+                ifaces["mic_set_vol"](ifaces["p_mic_vol"], 1.0, None)
+            except Exception:
+                pass
+
+    def _get_com_interfaces(self):
+        if os.name != "nt":
+            return None
+        if getattr(self._tls, "initialized", False):
+            return getattr(self._tls, "ifaces", None)
+        try:
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", ctypes.c_ulong),
+                    ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+                def __init__(self, g_str):
+                    s = g_str.strip("{}").replace("-", "")
+                    self.Data1 = int(s[0:8], 16)
+                    self.Data2 = int(s[8:12], 16)
+                    self.Data3 = int(s[12:16], 16)
+                    b = bytes.fromhex(s[16:32])
+                    for idx_b in range(8):
+                        self.Data4[idx_b] = b[idx_b]
+
+            ole32 = ctypes.windll.ole32
+            ole32.CoInitialize(None)
+            clsid_enum = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+            iid_enum = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+            p_enum = ctypes.c_void_p()
+            hr = ole32.CoCreateInstance(
+                ctypes.byref(clsid_enum), None, 1, ctypes.byref(iid_enum), ctypes.byref(p_enum)
+            )
+            if hr != 0 or not p_enum.value:
+                self._tls.initialized = True
+                self._tls.ifaces = None
+                return None
+
+            vt_enum = ctypes.cast(
+                ctypes.cast(p_enum, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            GetDefaultAudioEndpoint = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)
+            )(vt_enum[4])
+
+            iid_epvol = GUID("{5CDF2C82-841E-4546-9722-0CF74078229A}")
+            iid_meter = GUID("{C02216F6-8C67-4B5B-9D00-D008E73E0064}")
+
+            # eRender (0) = Speakers
+            p_spk_dev = ctypes.c_void_p()
+            GetDefaultAudioEndpoint(p_enum, 0, 0, ctypes.byref(p_spk_dev))
+            vt_spk_dev = ctypes.cast(
+                ctypes.cast(p_spk_dev, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            ActivateSpk = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
+            )(vt_spk_dev[3])
+
+            p_spk_vol = ctypes.c_void_p()
+            ActivateSpk(p_spk_dev, ctypes.byref(iid_epvol), 1, None, ctypes.byref(p_spk_vol))
+            vt_spk_vol = ctypes.cast(
+                ctypes.cast(p_spk_vol, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+
+            p_spk_meter = ctypes.c_void_p()
+            ActivateSpk(p_spk_dev, ctypes.byref(iid_meter), 1, None, ctypes.byref(p_spk_meter))
+            vt_spk_meter = ctypes.cast(
+                ctypes.cast(p_spk_meter, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+
+            # eCapture (1) = Default Mic (Stereo Mix)
+            p_mic_dev = ctypes.c_void_p()
+            GetDefaultAudioEndpoint(p_enum, 1, 0, ctypes.byref(p_mic_dev))
+            vt_mic_dev = ctypes.cast(
+                ctypes.cast(p_mic_dev, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            ActivateMic = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
+            )(vt_mic_dev[3])
+            p_mic_vol = ctypes.c_void_p()
+            ActivateMic(p_mic_dev, ctypes.byref(iid_epvol), 1, None, ctypes.byref(p_mic_vol))
+            vt_mic_vol = ctypes.cast(
+                ctypes.cast(p_mic_vol, ctypes.POINTER(ctypes.c_void_p))[0],
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+
+            SetMuteFn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+            GetMuteFn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
+            SetVolFn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_float, ctypes.c_void_p)
+            GetVolFn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float))
+            GetPeakFn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float))
+
+            ifaces = {
+                "p_spk_vol": p_spk_vol,
+                "spk_set_mute": SetMuteFn(vt_spk_vol[14]),
+                "spk_get_mute": GetMuteFn(vt_spk_vol[15]),
+                "spk_set_vol": SetVolFn(vt_spk_vol[7]),
+                "spk_get_vol": GetVolFn(vt_spk_vol[9]),
+                "p_spk_meter": p_spk_meter,
+                "spk_get_peak": GetPeakFn(vt_spk_meter[3]),
+                "p_mic_vol": p_mic_vol,
+                "mic_set_mute": SetMuteFn(vt_mic_vol[14]),
+                "mic_set_vol": SetVolFn(vt_mic_vol[7]),
+            }
+            self._tls.initialized = True
+            self._tls.ifaces = ifaces
+            return ifaces
+        except Exception:
+            self._tls.initialized = True
+            self._tls.ifaces = None
+            return None
+
+    @property
+    def allow_bus_output(self) -> bool:
+        if not self.speakers_muted_by_bridge or self.unmute_drain_started > 0.0:
+            return False
+        return (time.time() - self.muted_since) >= 0.016
+
+    def is_other_pc_app_playing(self) -> bool:
+        now = time.time()
+        if not self.speakers_muted_by_bridge:
+            ifaces = self._get_com_interfaces()
+            if ifaces is not None:
+                try:
+                    pk = ctypes.c_float()
+                    ifaces["spk_get_peak"](ifaces["p_spk_meter"], ctypes.byref(pk))
+                    if pk.value > 0.018:
+                        self.last_pc_playback_ts = now
+                        return True
+                except Exception:
+                    pass
+        return (now - self.last_pc_playback_ts) < 0.55
+
+    def on_voice_activity(self):
+        now = time.time()
+        self.last_voice_ts = now
+        with self.lock:
+            self.unmute_drain_started = 0.0
+            if not self.speakers_muted_by_bridge:
+                ifaces = self._get_com_interfaces()
+                if ifaces is not None:
+                    try:
+                        cur_m = ctypes.c_int()
+                        ifaces["spk_get_mute"](ifaces["p_spk_vol"], ctypes.byref(cur_m))
+                        cur_v = ctypes.c_float()
+                        ifaces["spk_get_vol"](ifaces["p_spk_vol"], ctypes.byref(cur_v))
+                        if cur_m.value == 0 and 0.05 <= cur_v.value <= 0.85:
+                            self.saved_spk_vol = float(cur_v.value)
+                        # 1. Hardware-mute physical speakers FIRST so zero voice comes out of PC speakers!
+                        ifaces["spk_set_mute"](ifaces["p_spk_vol"], 1, None)
+                        # 2. Set digital bus to 95% and Stereo Mix Default Mic to 100% unmuted for Filmora!
+                        ifaces["spk_set_vol"](ifaces["p_spk_vol"], 0.95, None)
+                        ifaces["mic_set_mute"](ifaces["p_mic_vol"], 0, None)
+                        ifaces["mic_set_vol"](ifaces["p_mic_vol"], 1.0, None)
+                    except Exception:
+                        pass
+                self.speakers_muted_by_bridge = True
+                self.muted_since = now
+
+    def check_idle_and_restore_speakers(self, audio_queue: queue.Queue, force: bool = False):
+        now = time.time()
+        with self.lock:
+            if not self.speakers_muted_by_bridge:
+                return
+            if not force and (now - self.last_voice_ts) < 0.60:
+                return
+            if self.unmute_drain_started == 0.0:
+                self.unmute_drain_started = now
+                while not audio_queue.empty():
+                    try:
+                        audio_queue.get_nowait()
+                    except Exception:
+                        break
+                if not force:
+                    return
+            if not force and (now - self.unmute_drain_started) < 0.090:
+                return
+            ifaces = self._get_com_interfaces()
+            if ifaces is not None:
+                try:
+                    ifaces["spk_set_vol"](ifaces["p_spk_vol"], float(self.saved_spk_vol), None)
+                    ifaces["spk_set_mute"](ifaces["p_spk_vol"], 0, None)
+                except Exception:
+                    pass
+            self.speakers_muted_by_bridge = False
+            self.unmute_drain_started = 0.0
+
+
 class MotoMicEngine:
     def __init__(self):
         self.running = True
@@ -436,12 +666,14 @@ class MotoMicEngine:
 
         # Audio Processing & Virtual Mic / Output Routing (ON by default for Filmora & all external recorders!)
         self.gain = 1.0
-        self.noise_gate_db = -55.0
+        self.noise_gate_db = -45.0
         self.monitor_enabled = True
         self.virtual_mic_installed = False
         self.anti_echo_enabled = False
         self.selected_output_device = None
         self.output_device_name = "None"
+        self.silent_bridge = SilentVirtualMicBridge()
+        # Ensure physical speakers start unmuted at normal volume while Stereo Mix is Default Mic
         self.windows_default_mic_name = configure_windows_default_mic_for_recorders(restore_physical_mic=False)
 
         # Screen Recording Audio Options: Record PC System Sound + Voice Over (Phone Mic / PC Mic)
@@ -748,6 +980,7 @@ class MotoMicEngine:
         self.connected = False
         self.current_rms = 0.0
         self.current_db = -60.0
+        self.silent_bridge.check_idle_and_restore_speakers(self.audio_queue, force=True)
         while not self.audio_queue.empty():
             try:
                 self.audio_queue.get_nowait()
@@ -770,15 +1003,16 @@ class MotoMicEngine:
             device_idx = self.selected_output_device
 
         def audio_callback(outdata, frames, time_info, status):
-            # When recording inside External Tools (Filmora, OBS, etc.), self.is_recording_mp4 is False,
-            # so full clarity audio is fed into Windows Default Mic (Stereo Mix / CABLE Output) & System Audio!
-            # When recording inside Webcam Master's own Screen Recorder without VB-Cable, mute speaker loopback
-            # because Webcam Master already mixes the direct digital phone mic stream into the MP4 file.
+            # When using Stereo Mix without VB-Cable, ONLY output to the digital bus while
+            # self.silent_bridge.allow_bus_output is True (i.e. physical PC speakers are 100% hardware-muted!).
+            # This guarantees ZERO sound ever comes out of the PC speakers when speaking on the mobile phone,
+            # while Filmora & all external recorders capture 100% of the voice from Default Mic (Stereo Mix)!
             if (
                 not self.monitor_enabled
                 or not self.stream_enabled
                 or self.app_mode == "WEBCAM_ONLY"
                 or (self.is_recording_mp4 and not self.virtual_mic_installed)
+                or (not self.virtual_mic_installed and not self.silent_bridge.allow_bus_output)
             ):
                 outdata.fill(0)
                 return
@@ -813,6 +1047,7 @@ class MotoMicEngine:
             self.log(f"Could not open audio output stream: {e}")
 
     def stop_audio_output(self):
+        self.silent_bridge.check_idle_and_restore_speakers(self.audio_queue, force=True)
         if self.audio_stream is not None:
             try:
                 self.audio_stream.stop()
@@ -1360,18 +1595,32 @@ class MotoMicEngine:
                 self.vis_buffer[-n:] = gated_f32
 
         if self.monitor_enabled and self.audio_stream_active and self.app_mode != "WEBCAM_ONLY":
-            block_size = 960
-            for i in range(0, len(gated_f32), block_size):
-                blk = gated_f32[i:i + block_size]
-                while self.audio_queue.full():
+            if self.virtual_mic_installed:
+                can_queue = True
+            else:
+                if self.current_db >= self.noise_gate_db and not mute_for_mode:
+                    if not self.silent_bridge.is_other_pc_app_playing() or self.current_db >= -24.0:
+                        self.silent_bridge.on_voice_activity()
+                        can_queue = True
+                    else:
+                        can_queue = False
+                else:
+                    self.silent_bridge.check_idle_and_restore_speakers(self.audio_queue, force=False)
+                    can_queue = False
+
+            if can_queue:
+                block_size = 960
+                for i in range(0, len(gated_f32), block_size):
+                    blk = gated_f32[i:i + block_size]
+                    while self.audio_queue.full():
+                        try:
+                            self.audio_queue.get_nowait()
+                        except queue.Empty:
+                            break
                     try:
-                        self.audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                try:
-                    self.audio_queue.put_nowait(blk)
-                except Exception:
-                    pass
+                        self.audio_queue.put_nowait(blk)
+                    except Exception:
+                        pass
 
         pcm_out = (gated_f32 * 32767.0).astype("<i2").tobytes()
         if self.is_recording:
@@ -1702,6 +1951,7 @@ class MotoMicEngine:
         except Exception:
             pass
         finally:
+            self.silent_bridge.check_idle_and_restore_speakers(self.audio_queue, force=True)
             if not logged_connect and addr[0] != "127.0.0.1" and addr[0] not in getattr(self, "local_ips", set()):
                 self.standby_phone_detected = True
                 self.standby_phone_label = f"{clean_device_name(self.device_name)} ({addr[0]})"
@@ -1720,7 +1970,7 @@ class MotoMicEngine:
 
     def _udp_audio_and_discovery_loop(self):
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SOL_REUSEADDR, 1)
         try:
             udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         except Exception:
@@ -1805,6 +2055,8 @@ class MotoMicEngine:
         time.sleep(1.5)
 
         while self.running:
+            if not self.connected or (self.last_packet_time > 0 and (time.time() - self.last_packet_time > 0.8)):
+                self.silent_bridge.check_idle_and_restore_speakers(self.audio_queue, force=True)
             if not self.virtual_mic_installed:
                 if self._auto_detect_virtual_mic_device():
                     self.start_audio_output(self.sample_rate, self.selected_output_device)
@@ -2920,6 +3172,8 @@ class MotoMicApp:
     # ==================== SAVED MEDIA FILE ACTIONS ====================
 
     def _play_latest_media_file(self):
+        self.engine.silent_bridge.check_idle_and_restore_speakers(self.engine.audio_queue, force=True)
+        self.engine.silent_bridge.last_pc_playback_ts = time.time()
         fp = self.engine.last_saved_media_file or self.engine._find_latest_saved_media()
         if fp and os.path.isfile(fp):
             try:

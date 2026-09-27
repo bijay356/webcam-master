@@ -5,7 +5,7 @@ a = Analysis(
     ['f:/pc software/pc_app/motomic_pc.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('f:/pc software/assets', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
