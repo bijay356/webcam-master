@@ -1,0 +1,38 @@
+# PyInstaller & Python Build Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+build_*/
+dist/
+dist_*/
+_internal/
+
+# Android Build Intermediates & Legacy Prototype
+MotoMicNative/build/
+MotoMicNative/*.keystore
+MotoMicNative/*.idsig
+MotoMicApp/
+*.idsig
+
+# User Recordings, Temp Media & Test Snapshots
+recordings/
+snap_*.jpg
+phone_screenshot.png
+*.mp4
+*.wav
+*.avi
+
+# Legacy Binaries
+MotoMicPC.exe
+MotoMicPC_v3.exe
+MotoMicPC.spec
+pc_app/MotoMicPC.spec
+pc_app/Launcher.cs
+MotoMicPro.apk
+test_motomic_system.py
+
+# Heavy Driver Archives (Keep installer script)
+drivers/unitycapture/*.zip
+drivers/unitycapture/UnityCapture-master/UnityCaptureSample/
+drivers/vbcable/*.zip
