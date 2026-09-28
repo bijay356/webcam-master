@@ -293,6 +293,7 @@ def configure_windows_default_mic_for_recorders(restore_physical_mic: bool = Fal
     stereo_name = None
     phys_ep = None
     phys_name = None
+    phys_eps = []
 
     try:
         cap_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
@@ -305,6 +306,12 @@ def configure_windows_default_mic_for_recorders(restore_physical_mic: bool = Fal
                 except OSError:
                     break
                 try:
+                    dev_state = 1
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{cap_path}\\{sub}", 0, winreg.KEY_READ) as sk:
+                        dev_state, _ = winreg.QueryValueEx(sk, "DeviceState")
+                    # Skip endpoints that are NotPresent (0x4) or Unplugged (0x8)
+                    if (int(dev_state) & 0xF) not in (0x1, 0x2):
+                        continue
                     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{cap_path}\\{sub}\\Properties", 0, winreg.KEY_READ) as pk:
                         dev_desc = ""
                         iface_name = ""
@@ -329,7 +336,8 @@ def configure_windows_default_mic_for_recorders(restore_physical_mic: bool = Fal
                             stereo_ep = ep_id
                             stereo_name = full_label
                         elif ("microphone" in dl or "mic" in dl) and "pc speaker" not in dl:
-                            if phys_ep is None or "array" in dl:
+                            phys_eps.append(ep_id)
+                            if phys_ep is None or "realtek" in dl or "array" in dl:
                                 phys_ep = ep_id
                                 phys_name = full_label
                 except Exception:
@@ -385,18 +393,54 @@ def configure_windows_default_mic_for_recorders(restore_physical_mic: bool = Fal
                     SetEndpointVisibility(ptr, ep, 1)
 
             if restore_physical_mic and phys_ep and not cable_ep:
+                for p_ep in phys_eps:
+                    SetEndpointVisibility(ptr, p_ep, 1)
                 target_ep, target_name = phys_ep, phys_name
             elif cable_ep:
+                for p_ep in phys_eps:
+                    SetEndpointVisibility(ptr, p_ep, 0)
                 target_ep, target_name = cable_ep, cable_name
             elif stereo_ep:
+                for p_ep in phys_eps:
+                    SetEndpointVisibility(ptr, p_ep, 0)
                 target_ep, target_name = stereo_ep, stereo_name
             else:
+                for p_ep in phys_eps:
+                    SetEndpointVisibility(ptr, p_ep, 1)
                 target_ep, target_name = phys_ep, (phys_name or "Windows Default Mic")
 
             if target_ep:
                 for role in (0, 1, 2):  # eConsole, eMultimedia, eCommunications
                     SetDefaultEndpoint(ptr, target_ep, role)
-            return target_name or "Stereo Mix (Realtek(R) Audio)"
+
+            chosen_name = target_name or "Stereo Mix (Realtek(R) Audio)"
+            filmora_pref_mic = cable_name or stereo_name or chosen_name
+            try:
+                filmora_xml = os.path.join(
+                    os.environ.get("APPDATA", ""),
+                    "Wondershare",
+                    "Wondershare Filmora",
+                    "Settingdatas.xml",
+                )
+                if os.path.isfile(filmora_xml):
+                    with open(filmora_xml, "r", encoding="utf-8", errors="ignore") as f_in:
+                        xml_txt = f_in.read()
+                    new_xml = re.sub(
+                        r"<m_sSelectedAudioDeviceName>.*?</m_sSelectedAudioDeviceName>",
+                        f"<m_sSelectedAudioDeviceName>{filmora_pref_mic}</m_sSelectedAudioDeviceName>",
+                        xml_txt,
+                    )
+                    new_xml = re.sub(
+                        r"<AudioSilent>.*?</AudioSilent>",
+                        "<AudioSilent>false</AudioSilent>",
+                        new_xml,
+                    )
+                    if new_xml != xml_txt:
+                        with open(filmora_xml, "w", encoding="utf-8") as f_out:
+                            f_out.write(new_xml)
+            except Exception:
+                pass
+            return chosen_name
     except Exception:
         pass
 
@@ -559,24 +603,7 @@ class SilentVirtualMicBridge:
 
     @property
     def allow_bus_output(self) -> bool:
-        if not self.speakers_muted_by_bridge or self.unmute_drain_started > 0.0:
-            return False
-        return (time.time() - self.muted_since) >= 0.016
-
-    def is_other_pc_app_playing(self) -> bool:
-        now = time.time()
-        if not self.speakers_muted_by_bridge:
-            ifaces = self._get_com_interfaces()
-            if ifaces is not None:
-                try:
-                    pk = ctypes.c_float()
-                    ifaces["spk_get_peak"](ifaces["p_spk_meter"], ctypes.byref(pk))
-                    if pk.value > 0.018:
-                        self.last_pc_playback_ts = now
-                        return True
-                except Exception:
-                    pass
-        return (now - self.last_pc_playback_ts) < 0.55
+        return self.speakers_muted_by_bridge and self.unmute_drain_started == 0.0
 
     def on_voice_activity(self):
         now = time.time()
@@ -609,7 +636,7 @@ class SilentVirtualMicBridge:
         with self.lock:
             if not self.speakers_muted_by_bridge:
                 return
-            if not force and (now - self.last_voice_ts) < 0.60:
+            if not force and (now - self.last_voice_ts) < 2.50:
                 return
             if self.unmute_drain_started == 0.0:
                 self.unmute_drain_started = now
@@ -666,7 +693,7 @@ class MotoMicEngine:
 
         # Audio Processing & Virtual Mic / Output Routing (ON by default for Filmora & all external recorders!)
         self.gain = 1.0
-        self.noise_gate_db = -45.0
+        self.noise_gate_db = -54.0
         self.monitor_enabled = True
         self.virtual_mic_installed = False
         self.anti_echo_enabled = False
@@ -1565,14 +1592,6 @@ class MotoMicEngine:
             samples_f32 = np.clip(samples_f32 * self.gain, -1.0, 1.0)
 
         rms = float(np.sqrt(np.mean(samples_f32 * samples_f32))) if len(samples_f32) > 0 else 0.0
-
-        now = time.time()
-        dt_spk = now - self._last_speaker_play_time
-        if self.monitor_enabled and not self.virtual_mic_installed and self.anti_echo_enabled and 0.020 <= dt_spk <= 0.380:
-            if rms < max(0.08, self._last_speaker_play_rms * 1.25):
-                samples_f32 = samples_f32 * 0.0
-                rms = 0.0
-
         db = 20.0 * math.log10(max(rms, 1e-6))
         self.current_rms = rms
         self.current_db = max(-60.0, min(0.0, db))
@@ -1599,19 +1618,17 @@ class MotoMicEngine:
                 can_queue = True
             else:
                 if self.current_db >= self.noise_gate_db and not mute_for_mode:
-                    if not self.silent_bridge.is_other_pc_app_playing() or self.current_db >= -24.0:
-                        self.silent_bridge.on_voice_activity()
-                        can_queue = True
-                    else:
-                        can_queue = False
+                    self.silent_bridge.on_voice_activity()
+                    can_queue = True
                 else:
                     self.silent_bridge.check_idle_and_restore_speakers(self.audio_queue, force=False)
-                    can_queue = False
+                    can_queue = self.silent_bridge.allow_bus_output
 
             if can_queue:
+                bus_f32 = np.tanh(gated_f32 * 1.8).astype(np.float32) if not self.virtual_mic_installed else gated_f32
                 block_size = 960
-                for i in range(0, len(gated_f32), block_size):
-                    blk = gated_f32[i:i + block_size]
+                for i in range(0, len(bus_f32), block_size):
+                    blk = bus_f32[i:i + block_size]
                     while self.audio_queue.full():
                         try:
                             self.audio_queue.get_nowait()
@@ -2367,6 +2384,10 @@ class MotoMicApp:
             pass
         self.engine.running = False
         self.engine.stop_audio_output()
+        try:
+            configure_windows_default_mic_for_recorders(restore_physical_mic=True)
+        except Exception:
+            pass
         if self.engine.virtual_cam is not None:
             try:
                 self.engine.virtual_cam.close()
